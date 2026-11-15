@@ -6,6 +6,7 @@ This module handles system commands like /compact, /new, /clear, etc.
 
 import json
 import logging
+import re
 import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -109,6 +110,65 @@ ReMeActionAuthorizer = Callable[
 def _fmt_tokens(n: int) -> str:
     """Format token count as e.g. '82.3k' or '450'."""
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+_HISTORY_RANGE_RE = re.compile(r"^:?(\d+)?(?:-(\d+)?)?$")
+
+
+def _parse_history_range(
+    raw: str,
+) -> tuple[int | None, int | None, int | None, str | None]:
+    """Parse the optional ``/history`` range argument.
+
+    Accepted forms (all 1-based, inclusive)::
+
+        ""        -> whole history          -> (None, None, None)
+        "20"      -> last 20 messages       -> (None, None, 20)
+        ":5-20"   -> messages 5 through 20  -> (5, 20, None)
+        "5-20"    -> same as ":5-20"
+        ":10"     -> messages 10 to end     -> (10, None, None)
+
+    Returns ``(start, end, tail, error)``. ``error`` is a user-facing message
+    when the argument is present but not parseable, so a typo is reported rather
+    than silently swallowed — which is what happened while this argument was
+    ignored and every accepted-looking form rendered the full history.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None, None, None, None
+
+    match = _HISTORY_RANGE_RE.match(text)
+    if not match:
+        return None, None, None, (
+            f"**Unrecognized range** `{text}`\n\n"
+            "Use `/history` (everything), `/history 20` (last 20), "
+            "or `/history :5-20` (messages 5 through 20)."
+        )
+
+    first, second = match.group(1), match.group(2)
+    if first is None and second is None:
+        # ":" or "-" with no digits at all.
+        return None, None, None, None
+
+    # A bare number with no colon or dash means "the last N messages".
+    if ":" not in text and "-" not in text:
+        count = int(first)
+        if count <= 0:
+            return None, None, None, (
+                f"**Unrecognized range** `/history {text}`\n\n"
+                "The message count must be 1 or greater."
+            )
+        return None, None, count, None
+
+    start = int(first) if first else 1
+    end = int(second) if second else None
+
+    if start < 1 or (end is not None and end < start):
+        return None, None, None, (
+            f"**Unrecognized range** `{text}`\n\n"
+            "Ranges are 1-based and the end must not be lower than the start."
+        )
+    return start, end, None, None
 
 
 class ConversationCommandHandlerMixin:
@@ -792,15 +852,29 @@ class CommandHandler(ConversationCommandHandlerMixin):
         _messages: list[Msg],
         _args: str = "",
     ) -> Msg:
-        """Process /history command."""
+        """Process /history command.
+
+        ``_args`` optionally narrows the listing: ``/history 20`` shows the last
+        20 messages, and ``/history :5-20`` (or ``5-20``) shows an explicit
+        1-based inclusive range. Without a range the whole history is shown.
+        Previously the argument was ignored entirely, so every accepted form
+        silently produced the same full dump.
+        """
         agent_config = await self._get_runtime_config_async()
         running_config = agent_config.running
         from .utils import get_token_counter
+
+        start, end, tail, range_error = _parse_history_range(_args)
+        if range_error:
+            return await self._make_system_msg(range_error)
 
         history_str = await format_history_str(
             self._state,
             get_token_counter(agent_config),
             (await run_sync_io(get_model_max_input_length, agent_config)),
+            start=start,
+            end=end,
+            tail=tail,
         )
 
         # Truncate if too long

@@ -48,16 +48,42 @@ async def format_history_str(
     state: "AgentState",
     token_counter: EstimatedTokenCounter,
     max_input_length: int,
+    start: int | None = None,
+    end: int | None = None,
+    tail: int | None = None,
 ) -> str:
-    """Render the ``/history`` reply text."""
+    """Render the ``/history`` reply text.
+
+    The optional bounds narrow the listing so ``/history 20`` and
+    ``/history :5-20`` can show a slice:
+
+    * ``tail`` keeps the last N messages (``/history 20``);
+    * ``start``/``end`` are 1-based inclusive bounds (``/history :5-20``).
+
+    The summary header always describes the whole history, and rendered row
+    indices stay absolute so ``/message <index>`` keeps working on a narrowed
+    view.
+    """
     stats = await estimate_context_tokens(
         state,
         token_counter,
         max_input_length,
     )
 
+    all_messages = stats["messages_detail"]
+    total = len(all_messages)
+
+    if tail is not None and tail > 0:
+        lo = max(1, total - tail + 1)
+        hi = total
+    else:
+        # Normalise the requested window into inclusive 1-based bounds.
+        lo = 1 if start is None else max(1, min(start, total or 1))
+        hi = total if end is None else max(lo, min(end, total or 1))
+    window = all_messages[lo - 1 : hi] if total else []
+
     lines = []
-    for i, msg_stat in enumerate(stats["messages_detail"], 1):
+    for i, msg_stat in enumerate(window, lo):
         blocks_info = ""
         if msg_stat.content:
             block_strs = [
@@ -72,6 +98,13 @@ async def format_history_str(
             f"{blocks_info}\n    preview: {msg_stat.preview}",
         )
 
+    body = "\n\n".join(lines)
+    if total and (lo > 1 or hi < total):
+        body += (
+            f"\n\n_Showing messages {lo}-{hi} of {total}. "
+            "Omit the range or widen it to see more._"
+        )
+
     return (
         f"**Conversation History**\n\n"
         f"- Total messages: {stats['total_messages']}\n"
@@ -80,5 +113,5 @@ async def format_history_str(
         f"- Context usage: "
         f"{stats['context_usage_ratio']:.1f}%\n"
         f"- Compressed summary tokens: "
-        f"{stats['compressed_summary_tokens']}\n\n" + "\n\n".join(lines)
+        f"{stats['compressed_summary_tokens']}\n\n" + body
     )
